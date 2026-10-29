@@ -1,0 +1,67 @@
+{
+  "name": "Local GPU Video Generation Library",
+  "library_schema_version": "0.10.0",
+  "settings": [],
+  "metadata": {
+    "author": "Custom",
+    "description": "Local GPU video generation nodes - Wan2.1-Fun-Control + AnimateDiff",
+    "library_version": "0.1.0",
+    "engine_version": "0.89.0",
+    "tags": ["local", "gpu", "video", "generation", "wan", "animatediff"],
+    "dependencies": {
+      "pip_dependencies": ["requests", "pillow>=11.0.0"]
+    },
+    "declarations": []
+  },
+  "advanced_library_path": "griptape_nodes_library/videogen_library_advanced.py",
+  "widgets": [],
+  "categories": [],
+  "nodes": [
+    {
+      "class_name": "WanVideoGeneration",
+      "file_path": "griptape_nodes_library/video/wan_video_generation.py",
+      "metadata": {
+        "category": "Video",
+        "description": "Generate video using Wan2.1-Fun-Control with depth/pose reference.",
+        "display_name": "Wan Video Generation",
+        "icon": "video",
+        "tags": ["video", "generation", "wan", "local", "control"]
+      }
+    },
+    {
+      "class_name": "AnimateDiffVideoGeneration",
+      "file_path": "griptape_nodes_library/video/animatediff_video_generation.py",
+      "metadata": {
+        "category": "Video",
+        "description": "Generate video using AnimateDiff + ControlNet with pose reference.",
+        "display_name": "AnimateDiff Video Generation",
+        "icon": "video",
+        "tags": ["video", "generation", "animatediff", "local", "controlnet"]
+      }
+    },
+    {
+      "class_name": "WanVideoGenerationInp",
+      "file_path": "griptape_nodes_library/video/wan_video_generation_inp.py",
+      "metadata": {
+        "category": "Video",
+        "description": "Generate style-consistent video using Wan2.1-Fun-InP. Style image (first frame) + depth video.",
+        "display_name": "Wan Video Generation (Style)",
+        "icon": "video",
+        "tags": ["video", "generation", "wan", "inpaint", "style", "local"]
+      }
+    },
+    {
+      "class_name": "MinimaxVideoGeneration",
+      "file_path": "griptape_nodes_library/video/minimax_video_generation.py",
+      "metadata": {
+        "category": "Video",
+        "description": "Generate video and native stereo audio locally using MiniMax-H3.",
+        "display_name": "Local MiniMax Video Generation",
+        "icon": "video",
+        "tags": ["local", "gpu", "video", "generation", "minimax", "audio", "h3"]
+      }
+    }
+  ],
+  "workflows": [],
+  "is_default_library": false
+}

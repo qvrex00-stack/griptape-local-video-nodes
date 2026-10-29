@@ -1,0 +1,129 @@
+class SequentialPipelineBlocks
+
+  Components:
+      image_processor (`VaeImageProcessor`)
+      text_encoder (`Qwen3VLForConditionalGeneration`)
+      tokenizer (`Qwen2Tokenizer`)
+      processor (`Qwen3VLProcessor`)
+      vae (`AutoencoderKLMiniMaxH3`)
+      audio_vae (`AutoencoderKLMiniMaxH3Audio`)
+      scheduler (`MiniMaxH3Scheduler`)
+      audio_scheduler (`MiniMaxH3Scheduler`)
+      transformer_ref (`MiniMaxH3Transformer3DModel`)
+      video_processor (`VideoProcessor`)
+
+  Configs:
+      canvas_short_edge (default: 768)
+      canvas_max_pixels (default: 1032192)
+
+  Inputs:
+      references (`list`):
+          The references to condition on, **in the order the model should read them**: the order labels them in the prompt
+          presentation and lays them out on the shared rotary clock, so a different order is a different request. One
+          dataclass per modality, all holding in-memory media — a [`MiniMaxH3ImageReference`] (at most 9), a
+          [`MiniMaxH3VideoReference`] at its own `fps` (at most 3, whose `audio` soundtrack is conditioned on as well), or a
+          [`MiniMaxH3AudioReference`] at its own `sample_rate` (at most 3) — for at most 12 references in total, and audio
+          references cannot be the only ones. These blocks never open a media file: decode with each class's `from_file`
+          classmethod, which brings the rates along.
+      height (`int`, *optional*):
+          Height of the generated video in pixels, a multiple of 32.
+      width (`int`, *optional*):
+          Width of the generated video in pixels, a multiple of 32.
+      num_frames (`int`):
+          Number of frames to generate, at the fixed 24 fps. Snapped up to the next `17 * n + 5` the video VAE can decode;
+          the resulting duration must stay between 5 and 15 seconds. To generate a video as long as a reference soundtrack,
+          pass `round(samples / sample_rate * 24)`.
+      prompt (`str`):
+          The prompt to guide generation, a single string.
+      prompt_embeds (`Tensor`, *optional*):
+          text embeddings used to guide the image generation. Can be generated from text_encoder step.
+      text_token_tags (`None`, *optional*):
+          TODO: Add description.
+      generator (`Generator`, *optional*):
+          The generator of the request. The conditioning noise is drawn from it first, one draw per condition, before the
+          noise of the generated rows.
+      latents (`Tensor`, *optional*):
+          Pre-generated video noise of shape `(1, 24, num_latent_frames, latent_height, latent_width)`, used instead of the
+          draw.
+      audio_latents (`Tensor`, *optional*):
+          Pre-generated audio noise of shape `(2, 32, num_audio_latents)`.
+      num_inference_steps (`int`):
+          The number of denoising steps.
+      **denoiser_input_fields (`None`, *optional*):
+          The structural description of the packed sequence the transformer reads by name: `token_tags`, `position_ids` and
+          the three row-index tensors.
+      attention_kwargs (`dict`, *optional*):
+          Additional kwargs for attention processors.
+      output_type (`str`, *optional*, defaults to pil):
+          Output format: 'pil', 'np' or 'pt'.
+
+  Outputs:
+      height (`int`):
+          Resolved height of the generated video in pixels.
+      width (`int`):
+          Resolved width of the generated video in pixels.
+      num_frames (`int`):
+          Resolved number of frames, of the form 17 * n + 5.
+      normalized_references (`list`):
+          The references normalized onto MiniMax-H3's own rates and resolutions, in packed order: the same public reference
+          types the request passed in, with an image resized to its own 2048 pixel short edge, a video resampled onto 24 fps
+          and onto the canvas its own aspect ratio resolves to, and a soundtrack put on the audio VAE's sample rate and
+          truncated to the generated duration.
+      prompt_embeds (`Tensor`):
+          The hidden state MiniMax-H3 conditions on, of shape `(1, num_text_tokens, 5120)`, read after the 50th decoder layer
+          of the Qwen3-VL conditioner.
+      text_token_tags (`Tensor`):
+          The per-row modality tag of every row of `prompt_embeds`; a vision block is tagged as video.
+      condition_latents (`list`):
+          The encoded video conditioning latents of the image and video references, one `(1, latent_channels,
+          num_latent_frames, latent_height, latent_width)` tensor each in packed order, or None when the references carry
+          none.
+      audio_condition_latents (`list`):
+          The clean audio conditioning rows of the reference soundtracks, one `(num_audio_latents * 2,
+          audio_latent_channels)` tensor per audio-bearing reference in packed order. One entry per reference rather than one
+          concatenated block, because the packed layout is built from the row count of each.
+      num_latent_frames (`int`):
+          Number of generated video latent frames.
+      latent_height (`int`):
+          Height of the generated video latents.
+      latent_width (`int`):
+          Width of the generated video latents.
+      num_audio_latents (`int`):
+          Number of generated audio latents per channel.
+      position_ids (`Tensor`):
+          The `(t, h, w)` rotary coordinate of every row, in float64.
+      token_tags (`Tensor`):
+          The modality tag of every row.
+      video_indices (`Tensor`):
+          Sequence positions of the video rows, conditioning rows first.
+      audio_indices (`Tensor`):
+          Sequence positions of the audio rows, reference rows first.
+      text_indices (`Tensor`):
+          Sequence positions of the text rows.
+      num_condition_video_rows (`int`):
+          How many leading video rows are conditioning rows rather than generated rows.
+      num_condition_audio_rows (`int`):
+          How many leading audio rows are reference rows rather than generated rows.
+      condition_rows (`Tensor`):
+          The noised conditioning, packed into the leading video rows of the sequence.
+      latents (`Tensor`):
+          The generated video rows of the packed sequence.
+      audio_latents (`Tensor`):
+          The generated audio rows of the packed sequence, channel-major.
+      timesteps (`Tensor`):
+          Timesteps of the video schedule.
+      audio_timesteps (`Tensor`):
+          Timesteps of the audio schedule.
+      row_timestep_plan (`list`):
+          One `(timestep, timestep_indices)` pair per step: the distinct timesteps of the sequence and the index of every row
+          into them.
+      noise_pred (`Tensor`):
+          Predicted velocity of the video rows of the sequence.
+      audio_noise_pred (`Tensor`):
+          Predicted velocity of the audio rows of the sequence.
+      videos (`list`):
+          The generated video.
+      audio (`Tensor`):
+          The generated soundtrack, of shape `(1, 2, num_samples)`.
+      sampling_rate (`int`):
+          Sample rate of the generated soundtrack in Hz.
