@@ -123,26 +123,15 @@ class MiniMaxH3AfterDenoiseStep(ModularPipelineBlocks):
         audio_rows = audio_rows.reshape(components.audio_channels, block_state.num_audio_latents, audio_rows.shape[-1])
         block_state.audio_latents = audio_rows.permute(0, 2, 1).contiguous()
 
-        # Evict transformer resident FP8 weights and GPU layers from CUDA to give VAE 22GB of free VRAM!
+        # Clean up any leftover temporary FP8 tensors without destroying resident model weights
         import gc
         for tf_name in ("transformer", "transformer_ref"):
             if hasattr(components, tf_name):
                 tf_mod = getattr(components, tf_name)
                 if tf_mod is not None:
-                    logger.info(f"[MiniMax-H3/AfterDenoise] Evicting {tf_name} FP8 weights from VRAM to provide 22GB headroom for VAE decode...")
                     for sub in tf_mod.modules():
-                        if hasattr(sub, "_fp8_weight"):
-                            del sub._fp8_weight
-                        if hasattr(sub, "_cuda_bias"):
-                            del sub._cuda_bias
-                        if isinstance(sub, torch.nn.Linear):
-                            sub.weight.data = torch.empty(0, device="cpu", dtype=torch.bfloat16)
-                            if sub.bias is not None and sub.bias.data.numel() > 0:
-                                sub.bias.data = torch.empty(0, device="cpu", dtype=torch.bfloat16)
-                    for child_name, child in tf_mod.named_children():
-                        if child_name not in ("blocks", "transformer_blocks", "token_refiner"):
-                            child.to(device="cpu")
-                    tf_mod._is_fp8_quantized = False
+                        if hasattr(sub, "_temp_fp8"):
+                            del sub._temp_fp8
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

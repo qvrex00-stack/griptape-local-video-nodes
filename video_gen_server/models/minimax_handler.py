@@ -677,118 +677,154 @@ def generate(
         if not hasattr(_pipeline, "vae") or getattr(_pipeline, "vae") is None:
             _pipeline.load_components(names=["vae", "audio_vae", "scheduler", "audio_scheduler"], dtype=torch.float32)
 
-        # Ultra-Fast In-VRAM FP8 Resident + CPU AdaLN Hybrid Acceleration (Zero-PCIe Denoising!)
+        # Ultra-Fast Dynamic VRAM In-VRAM FP8 Resident + Streaming Hybrid Acceleration
         if torch.cuda.is_available():
             tf = getattr(_pipeline, target_transformer, None)
-            if tf is not None and not getattr(tf, "_is_fp8_quantized", False):
-                logger.info(f"[MiniMax-H3] Setting up Ultra-Fast In-VRAM FP8 Hybrid Acceleration for {target_transformer}...")
-                
-                fp32_names = ("time_embedder", "norm_out", "proj_in", "proj_out", "audio_proj_in", "audio_proj_out", "rope")
-                for name, child in tf.named_children():
-                    if name not in ("blocks", "transformer_blocks", "token_refiner"):
-                        target_dtype = torch.float32 if any(fn in name for fn in fp32_names) else torch.bfloat16
-                        child.to(device="cuda", dtype=target_dtype)
-
-                # 4. Zero-PCIe In-VRAM hooks: dequantizes in VRAM at 1792 GB/s in 0.2ms
-                def make_fast_pre_hook():
-                    def hook(m, inp):
-                        for sub in m.modules():
-                            if isinstance(sub, torch.nn.Linear) and hasattr(sub, "_fp8_weight"):
-                                sub.weight.data = sub._fp8_weight.to(torch.bfloat16)
-                                if getattr(sub, "_cuda_bias", None) is not None:
-                                    sub.bias.data = sub._cuda_bias
-                    return hook
-
-                def make_fast_post_hook():
-                    def hook(m, inp, out):
-                        for sub in m.modules():
-                            if isinstance(sub, torch.nn.Linear) and hasattr(sub, "_fp8_weight"):
-                                sub.weight.data = torch.empty(0, device="cuda", dtype=torch.bfloat16)
-                                if sub.bias is not None and sub.bias.data.numel() > 0:
-                                    sub.bias.data = torch.empty(0, device="cuda", dtype=torch.bfloat16)
-                    return hook
-
-                # Setup token_refiner in FP8 as well (saves 0.6GB VRAM)
-                if hasattr(tf, "token_refiner") and tf.token_refiner is not None:
-                    for r_sub in tf.token_refiner.modules():
-                        if isinstance(r_sub, torch.nn.Linear):
-                            if not hasattr(r_sub, "_cpu_weight") or r_sub._cpu_weight is None:
-                                r_sub._cpu_weight = r_sub.weight.data.clone().to("cpu", dtype=torch.bfloat16)
-                            if not hasattr(r_sub, "_fp8_weight") or r_sub._fp8_weight is None or r_sub._fp8_weight.device.type != "cuda":
-                                r_sub._fp8_weight = r_sub._cpu_weight.to(device="cuda", dtype=torch.float8_e4m3fn)
-                            r_sub.weight.data = torch.empty(0, device="cuda", dtype=torch.bfloat16)
-                        else:
-                            for p in r_sub.parameters(recurse=False):
-                                p.data = p.data.to(device="cuda", dtype=torch.bfloat16)
-                    if not getattr(tf, "_fast_hooks_registered", False):
-                        tf.token_refiner.register_forward_pre_hook(make_fast_pre_hook())
-                        tf.token_refiner.register_forward_hook(make_fast_post_hook())
-
+            if tf is not None:
+                # Dynamic VRAM budgeting based on sequence length:
+                # At higher resolutions (e.g. 704x1248 = 26.5k tokens, 960x544 = 15.8k tokens), activations take 5-8GB.
+                # To guarantee zero Windows WDDM paging (staying strictly under 20GB total VRAM),
+                # we keep optimal blocks on GPU in FP8 and stream the remaining blocks from pinned CPU memory.
+                target_tokens = (width // 32) * (height // 32) * (_duration_to_frames(duration_seconds) // 4)
                 blocks = getattr(tf, "blocks", None) or getattr(tf, "transformer_blocks", None) or []
                 total_blocks = len(blocks)
-                
-                for b_idx, b in enumerate(blocks):
-                    # 1. Setup attn & ff Linear layers: resident in VRAM as FP8
-                    for mod in [getattr(b, "attn", None), getattr(b, "ff", None)]:
-                        if mod is None:
-                            continue
-                        for sub in mod.modules():
-                            if isinstance(sub, torch.nn.Linear):
-                                if not hasattr(sub, "_cpu_weight") or sub._cpu_weight is None:
-                                    sub._cpu_weight = sub.weight.data.clone().to("cpu", dtype=torch.bfloat16)
-                                if sub.bias is not None and (not hasattr(sub, "_cpu_bias") or sub._cpu_bias is None):
-                                    sub._cpu_bias = sub.bias.data.clone().to("cpu", dtype=torch.bfloat16)
 
-                                if not hasattr(sub, "_fp8_weight") or sub._fp8_weight is None or sub._fp8_weight.device.type != "cuda":
-                                    sub._fp8_weight = sub._cpu_weight.to(device="cuda", dtype=torch.float8_e4m3fn)
-                                sub.weight.data = torch.empty(0, device="cuda", dtype=torch.bfloat16)
+                if target_tokens > 22000:
+                    optimal_gpu_blocks = 26  # ~9.5GB weights + 8.5GB act = 18.0GB < 24GB
+                elif target_tokens > 14000:
+                    optimal_gpu_blocks = 34  # ~12.5GB weights + 5.5GB act = 18.0GB < 24GB
+                else:
+                    optimal_gpu_blocks = total_blocks  # All 50 blocks in VRAM for maximum speed!
 
-                                if sub.bias is not None:
-                                    if not hasattr(sub, "_cuda_bias") or sub._cuda_bias is None or sub._cuda_bias.device.type != "cuda":
-                                        sub._cuda_bias = sub._cpu_bias.to(device="cuda", dtype=torch.bfloat16)
-                                    sub.bias.data = torch.empty(0, device="cuda", dtype=torch.bfloat16)
+                current_gpu_blocks = getattr(tf, "_current_gpu_blocks", -1)
+                reconfigure_weights = (current_gpu_blocks != optimal_gpu_blocks) or not getattr(tf, "_is_fp8_quantized", False)
+
+                if reconfigure_weights:
+                    logger.info(f"[MiniMax-H3] Setting up Dynamic Hybrid Acceleration for {target_transformer} (GPU blocks={optimal_gpu_blocks}/{total_blocks}, tokens={target_tokens})...")
+                    print(f"[MiniMax-H3] Setting up Dynamic Hybrid Acceleration for {target_transformer} (GPU blocks={optimal_gpu_blocks}/{total_blocks}, tokens={target_tokens})...", flush=True)
+
+                    fp32_names = ("time_embedder", "norm_out", "proj_in", "proj_out", "audio_proj_in", "audio_proj_out", "rope")
+                    for name, child in tf.named_children():
+                        if name not in ("blocks", "transformer_blocks", "token_refiner"):
+                            target_dtype = torch.float32 if any(fn in name for fn in fp32_names) else torch.bfloat16
+                            child.to(device="cuda", dtype=target_dtype)
+
+                    # Unified Zero-Overhead Hook: handles both GPU resident and pinned CPU streaming
+                    def make_fast_pre_hook():
+                        def hook(m, inp):
+                            for sub in m.modules():
+                                if isinstance(sub, torch.nn.Linear):
+                                    if hasattr(sub, "_fp8_weight") and sub._fp8_weight is not None:
+                                        sub.weight.data = sub._fp8_weight.to(torch.bfloat16)
+                                    elif hasattr(sub, "_cpu_fp8") and sub._cpu_fp8 is not None:
+                                        sub._temp_fp8 = sub._cpu_fp8.to(device="cuda", non_blocking=True)
+                                        sub.weight.data = sub._temp_fp8.to(torch.bfloat16)
+                                    if getattr(sub, "_cuda_bias", None) is not None:
+                                        sub.bias.data = sub._cuda_bias
+                        return hook
+
+                    def make_fast_post_hook():
+                        def hook(m, inp, out):
+                            for sub in m.modules():
+                                if isinstance(sub, torch.nn.Linear):
+                                    sub.weight.data = torch.empty(0, device="cuda", dtype=torch.bfloat16)
+                                    if hasattr(sub, "_temp_fp8"):
+                                        del sub._temp_fp8
+                                    if sub.bias is not None and sub.bias.data.numel() > 0:
+                                        sub.bias.data = torch.empty(0, device="cuda", dtype=torch.bfloat16)
+                        return hook
+
+                    # Setup token_refiner in FP8 as well (saves 0.6GB VRAM)
+                    if hasattr(tf, "token_refiner") and tf.token_refiner is not None:
+                        for r_sub in tf.token_refiner.modules():
+                            if isinstance(r_sub, torch.nn.Linear):
+                                if not hasattr(r_sub, "_cpu_weight") or r_sub._cpu_weight is None:
+                                    r_sub._cpu_weight = r_sub.weight.data.clone().to("cpu", dtype=torch.bfloat16)
+                                if not hasattr(r_sub, "_fp8_weight") or r_sub._fp8_weight is None or r_sub._fp8_weight.device.type != "cuda":
+                                    r_sub._fp8_weight = r_sub._cpu_weight.to(device="cuda", dtype=torch.float8_e4m3fn)
+                                r_sub.weight.data = torch.empty(0, device="cuda", dtype=torch.bfloat16)
                             else:
-                                for p in sub.parameters(recurse=False):
+                                for p in r_sub.parameters(recurse=False):
                                     p.data = p.data.to(device="cuda", dtype=torch.bfloat16)
-
-                    # 2. Move norm1 and norm2 to CUDA
-                    if hasattr(b, "norm1") and b.norm1 is not None:
-                        b.norm1.to(device="cuda", dtype=torch.bfloat16)
-                    if hasattr(b, "norm2") and b.norm2 is not None:
-                        b.norm2.to(device="cuda", dtype=torch.bfloat16)
-
-                    # 3. CRUCIAL: Keep adaln_proj on CPU (zero VRAM overhead!)
-                    if hasattr(b, "adaln_proj") and b.adaln_proj is not None:
-                        b.adaln_proj.to(device="cpu", dtype=torch.bfloat16)
                         if not getattr(tf, "_fast_hooks_registered", False):
-                            def _make_fast_adaln(mod_adaln):
-                                def fast_adaln_forward(temb):
-                                    lin = mod_adaln.linear
-                                    target_dev = lin.weight.device
-                                    target_dtype = lin.weight.dtype
-                                    act = torch.nn.functional.silu(temb.to(device=target_dev, dtype=torch.float32)).to(target_dtype)
-                                    res = lin(act)
-                                    res_cuda = res.to(device="cuda", dtype=torch.bfloat16).view(-1, 6 * mod_adaln.hidden_size)
-                                    return res_cuda.chunk(6, dim=-1)
-                                return fast_adaln_forward
-                            b.adaln_proj.forward = _make_fast_adaln(b.adaln_proj)
+                            tf.token_refiner.register_forward_pre_hook(make_fast_pre_hook())
+                            tf.token_refiner.register_forward_hook(make_fast_post_hook())
 
-                    # 4. Separate per-submodule hooks (attn and ff separately, saving 50% peak VRAM)
-                    if not getattr(tf, "_fast_hooks_registered", False):
-                        if hasattr(b, "attn") and b.attn is not None:
-                            b.attn.register_forward_pre_hook(make_fast_pre_hook())
-                            b.attn.register_forward_hook(make_fast_post_hook())
-                        if hasattr(b, "ff") and b.ff is not None:
-                            b.ff.register_forward_pre_hook(make_fast_pre_hook())
-                            b.ff.register_forward_hook(make_fast_post_hook())
+                    for b_idx, b in enumerate(blocks):
+                        is_gpu_block = (b_idx < optimal_gpu_blocks)
+                        # 1. Setup attn & ff Linear layers
+                        for mod in [getattr(b, "attn", None), getattr(b, "ff", None)]:
+                            if mod is None:
+                                continue
+                            for sub in mod.modules():
+                                if isinstance(sub, torch.nn.Linear):
+                                    if not hasattr(sub, "_cpu_weight") or sub._cpu_weight is None:
+                                        sub._cpu_weight = sub.weight.data.clone().to("cpu", dtype=torch.bfloat16)
+                                    if sub.bias is not None and (not hasattr(sub, "_cpu_bias") or sub._cpu_bias is None):
+                                        sub._cpu_bias = sub.bias.data.clone().to("cpu", dtype=torch.bfloat16)
 
-                tf._fast_hooks_registered = True
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                                    if is_gpu_block:
+                                        if not hasattr(sub, "_fp8_weight") or sub._fp8_weight is None or sub._fp8_weight.device.type != "cuda":
+                                            sub._fp8_weight = sub._cpu_weight.to(device="cuda", dtype=torch.float8_e4m3fn)
+                                        sub._cpu_fp8 = None
+                                    else:
+                                        if hasattr(sub, "_fp8_weight"):
+                                            del sub._fp8_weight
+                                            sub._fp8_weight = None
+                                        if not hasattr(sub, "_cpu_fp8") or sub._cpu_fp8 is None:
+                                            sub._cpu_fp8 = sub._cpu_weight.to(dtype=torch.float8_e4m3fn).pin_memory()
 
-                tf._is_fp8_quantized = True
-                logger.info(f"[MiniMax-H3] {target_transformer} In-VRAM FP8 Hybrid setup complete ({_get_free_vram_gb():.1f}GB VRAM free)!")
+                                    sub.weight.data = torch.empty(0, device="cuda", dtype=torch.bfloat16)
+
+                                    if sub.bias is not None:
+                                        if not hasattr(sub, "_cuda_bias") or sub._cuda_bias is None or sub._cuda_bias.device.type != "cuda":
+                                            sub._cuda_bias = sub._cpu_bias.to(device="cuda", dtype=torch.bfloat16)
+                                        sub.bias.data = torch.empty(0, device="cuda", dtype=torch.bfloat16)
+                                else:
+                                    for p in sub.parameters(recurse=False):
+                                        p.data = p.data.to(device="cuda", dtype=torch.bfloat16)
+
+                        # 2. Move norm1 and norm2 to CUDA
+                        if hasattr(b, "norm1") and b.norm1 is not None:
+                            b.norm1.to(device="cuda", dtype=torch.bfloat16)
+                        if hasattr(b, "norm2") and b.norm2 is not None:
+                            b.norm2.to(device="cuda", dtype=torch.bfloat16)
+
+                        # 3. CRUCIAL: Keep adaln_proj on CPU (zero VRAM overhead!)
+                        if hasattr(b, "adaln_proj") and b.adaln_proj is not None:
+                            b.adaln_proj.to(device="cpu", dtype=torch.bfloat16)
+                            if not getattr(tf, "_fast_hooks_registered", False):
+                                def _make_fast_adaln(mod_adaln):
+                                    def fast_adaln_forward(temb):
+                                        lin = mod_adaln.linear
+                                        target_dev = lin.weight.device
+                                        target_dtype = lin.weight.dtype
+                                        act = torch.nn.functional.silu(temb.to(device=target_dev, dtype=torch.float32)).to(target_dtype)
+                                        res = lin(act)
+                                        res_cuda = res.to(device="cuda", dtype=torch.bfloat16).view(-1, 6 * mod_adaln.hidden_size)
+                                        return res_cuda.chunk(6, dim=-1)
+                                    return fast_adaln_forward
+                                b.adaln_proj.forward = _make_fast_adaln(b.adaln_proj)
+
+                        # 4. Separate per-submodule hooks (attn and ff separately, saving 50% peak VRAM)
+                        if not getattr(tf, "_fast_hooks_registered", False):
+                            if hasattr(b, "attn") and b.attn is not None:
+                                b.attn.register_forward_pre_hook(make_fast_pre_hook())
+                                b.attn.register_forward_hook(make_fast_post_hook())
+                            if hasattr(b, "ff") and b.ff is not None:
+                                b.ff.register_forward_pre_hook(make_fast_pre_hook())
+                                b.ff.register_forward_hook(make_fast_post_hook())
+
+                    tf._fast_hooks_registered = True
+                    tf._current_gpu_blocks = optimal_gpu_blocks
+                    tf._is_fp8_quantized = True
+
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    logger.info(f"[MiniMax-H3] {target_transformer} Dynamic Hybrid setup complete ({_get_free_vram_gb():.1f}GB VRAM free, GPU blocks={optimal_gpu_blocks}/{total_blocks})!")
+                    print(f"[MiniMax-H3] Dynamic Hybrid setup complete ({_get_free_vram_gb():.1f}GB VRAM free, GPU blocks={optimal_gpu_blocks}/{total_blocks})!", flush=True)
 
             # RoPE inv_freq must be exact float32 (a bf16 round-trip corrupts positional angles). Rebuild it.
             _tf_rope = getattr(getattr(_pipeline, target_transformer, None), "rope", None)
